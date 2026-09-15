@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     AI_FALLBACK_PROVIDER: str = "mistral"
     AI_TIMEOUT: int = 30
 
-    CORS_ORIGINS: list[str] = ["http://localhost:3000"]
+    CORS_ORIGINS: list[str] = ["*"]
 
     class Config:
         env_file = ".env"
