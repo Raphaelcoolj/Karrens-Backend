@@ -8,6 +8,8 @@ client: AsyncIOMotorClient = None
 
 
 def _extract_db_name(uri: str) -> str:
+    if settings.MONGODB_DB_NAME:
+        return settings.MONGODB_DB_NAME
     try:
         parsed = urlparse(uri)
         db = parsed.path.lstrip("/")

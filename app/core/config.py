@@ -4,6 +4,7 @@ from functools import lru_cache
 
 class Settings(BaseSettings):
     MONGODB_URL: str = "mongodb://localhost:27017/karren"
+    MONGODB_DB_NAME: str = ""
 
     TWELVE_DATA_API_KEY: str = ""
 
