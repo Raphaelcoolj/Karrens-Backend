@@ -1,4 +1,5 @@
 from motor.motor_asyncio import AsyncIOMotorClient
+from urllib.parse import urlparse
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -6,10 +7,22 @@ settings = get_settings()
 client: AsyncIOMotorClient = None
 
 
+def _extract_db_name(uri: str) -> str:
+    try:
+        parsed = urlparse(uri)
+        db = parsed.path.lstrip("/")
+        if db:
+            return db
+    except Exception:
+        pass
+    return "karren"
+
+
 async def connect_db():
     global client
     client = AsyncIOMotorClient(settings.MONGODB_URL)
-    db = client[settings.MONGODB_DB_NAME]
+    db_name = _extract_db_name(settings.MONGODB_URL)
+    db = client[db_name]
     await db.analyses.create_index("timestamp")
     await db.analyses.create_index("pair")
     await db.signals.create_index("timestamp")
@@ -24,4 +37,5 @@ async def close_db():
 
 
 def get_db():
-    return client[settings.MONGODB_DB_NAME]
+    db_name = _extract_db_name(settings.MONGODB_URL)
+    return client[db_name]

@@ -3,8 +3,7 @@ from functools import lru_cache
 
 
 class Settings(BaseSettings):
-    MONGODB_URL: str = "mongodb://localhost:27017"
-    MONGODB_DB_NAME: str = "karren"
+    MONGODB_URL: str = "mongodb://localhost:27017/karren"
 
     TWELVE_DATA_API_KEY: str = ""
 
@@ -24,6 +23,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+        extra = "ignore"
 
 
 @lru_cache
