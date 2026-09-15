@@ -226,10 +226,17 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 reason_code = result.reasons[0] if result.reasons else "NO_ENTRY_SCHEME"
                 reason = reasons_str or "Directional bias detected, waiting for entry confirmation."
         else:
-            trade_status = "VALIDATED"
-            trade_direction = result.direction
-            reason_code = None
-            reason = " | ".join(result.reasons) if result.reasons else "Entry validated."
+            has_entry = result.entry_low is not None and result.stop_loss is not None
+            if has_entry:
+                trade_status = "VALIDATED"
+                trade_direction = result.direction
+                reason_code = None
+                reason = " | ".join(result.reasons) if result.reasons else "Entry validated."
+            else:
+                trade_status = "WAITING_FOR_CONFIRMATION"
+                trade_direction = result.direction
+                reason_code = result.reasons[0] if result.reasons else "NO_ENTRY_SCHEME"
+                reason = " | ".join(result.reasons) if result.reasons else "Directional bias detected, waiting for entry setup."
 
         if trade_status == "VALIDATED":
             risk_label = _classify_risk(
