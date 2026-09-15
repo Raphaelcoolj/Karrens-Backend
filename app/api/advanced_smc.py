@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -81,7 +82,15 @@ class TradeStatusInfo(BaseModel):
 class DiagnosticsInfo(BaseModel):
     data_valid: bool = False
     candle_count: int = 0
+    requested_timeframe: str = ""
+    htf_timeframe: str = ""
+    middle_timeframe: str = ""
+    ltf_timeframe: str = ""
+    htf_candle_count: int = 0
+    middle_candle_count: int = 0
+    ltf_candle_count: int = 0
     htf_bias: str = "NEUTRAL"
+    middle_bias: str = "NEUTRAL"
     swing_high_count: int = 0
     swing_low_count: int = 0
     bos_count: int = 0
@@ -116,6 +125,24 @@ class AdvancedSMCResponse(BaseModel):
     current_price: Optional[float] = None
 
 
+INTERVAL_MAP = {
+    "1D": "1day", "4H": "4h", "1H": "1h",
+    "1W": "1week", "15m": "15min", "1m": "1min", "5m": "5min",
+}
+
+
+async def _fetch_candles(symbol: str, timeframe: str, limit: int = 200) -> list[Candle]:
+    td_interval = INTERVAL_MAP.get(timeframe, timeframe)
+    snapshot = await market_service.get_full_market_data(symbol, td_interval, limit)
+    return [
+        Candle(
+            timestamp=c.timestamp, open=c.open, high=c.high,
+            low=c.low, close=c.close, volume=c.volume,
+        )
+        for c in snapshot.candles
+    ]
+
+
 @router.post("", response_model=AdvancedSMCResponse)
 async def analyze_advanced_smc(req: AdvancedSMCRequest):
     try:
@@ -132,33 +159,22 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 detail=f"Invalid timeframe combination: {req.htf}/{req.middle_tf}/{req.ltf}",
             )
 
-        interval_map = {
-            "1D": "1day", "4H": "4h", "1H": "1h",
-            "1W": "1week", "15m": "15min", "1m": "1min", "5m": "5min",
-        }
+        symbol = req.symbol.upper()
 
-        td_interval = interval_map.get(config.middle_tf, "4h")
-
-        snapshot = await market_service.get_full_market_data(
-            req.symbol.upper(), td_interval, 200
+        htf_candles, middle_candles, ltf_candles = await asyncio.gather(
+            _fetch_candles(symbol, config.htf, 200),
+            _fetch_candles(symbol, config.middle_tf, 200),
+            _fetch_candles(symbol, config.ltf, 200),
         )
 
-        if not snapshot.candles:
-            raise HTTPException(status_code=404, detail=f"No candle data for {req.symbol}")
-
-        candles = [
-            Candle(
-                timestamp=c.timestamp, open=c.open, high=c.high,
-                low=c.low, close=c.close, volume=c.volume,
-            )
-            for c in snapshot.candles
-        ]
+        if not middle_candles:
+            raise HTTPException(status_code=404, detail=f"No candle data for {symbol} at {config.middle_tf}")
 
         strategy = AdvancedSMCStrategy(config)
-        result = strategy.analyze(candles)
-        result.symbol = req.symbol.upper()
+        result = strategy.analyze(htf_candles, middle_candles, ltf_candles)
+        result.symbol = symbol
 
-        current_price = candles[-1].close if candles else 0
+        current_price = middle_candles[-1].close if middle_candles else 0
 
         bias = result.market_bias
         has_bos = len(result.bos_events) > 0
@@ -186,7 +202,20 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
         )
 
         if result.direction == "NO_SIGNAL":
-            if bias == "NEUTRAL":
+            reasons_str = " | ".join(result.reasons) if result.reasons else ""
+            has_insufficient = any(
+                r.startswith("Insufficient") or "data" in r.lower()
+                for r in result.reasons
+            )
+            has_atr_zero = any("ATR is zero" in r for r in result.reasons)
+            has_invalid_config = any("Invalid timeframe" in r for r in result.reasons)
+
+            if has_insufficient or has_atr_zero or has_invalid_config:
+                trade_status = "INSUFFICIENT_DATA"
+                trade_direction = "NEUTRAL"
+                reason_code = result.reasons[0] if result.reasons else "INSUFFICIENT_DATA"
+                reason = reasons_str or "Insufficient or invalid market data for analysis."
+            elif bias == "NEUTRAL":
                 trade_status = "NO_SETUP"
                 trade_direction = "NEUTRAL"
                 reason_code = "NO_STRUCTURE"
@@ -195,7 +224,7 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 trade_status = "WAITING_FOR_CONFIRMATION"
                 trade_direction = bias
                 reason_code = result.reasons[0] if result.reasons else "NO_ENTRY_SCHEME"
-                reason = " | ".join(result.reasons) if result.reasons else "Directional bias detected, waiting for entry confirmation."
+                reason = reasons_str or "Directional bias detected, waiting for entry confirmation."
         else:
             trade_status = "VALIDATED"
             trade_direction = result.direction
@@ -248,7 +277,7 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             strategy="advanced_smc",
             timestamp=datetime.utcnow().isoformat(),
             bias=result.market_bias,
-            signal=result.direction,
+            signal=trade_direction if trade_status != "INSUFFICIENT_DATA" else "NEUTRAL",
             confidence=result.confidence,
             assessment=MarketAssessmentInfo(
                 direction=direction_for_assessment if direction_for_assessment != "NO_SIGNAL" else "NEUTRAL",
@@ -276,8 +305,16 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             ),
             diagnostics=DiagnosticsInfo(
                 data_valid=True,
-                candle_count=len(candles),
-                htf_bias=bias,
+                candle_count=len(middle_candles),
+                requested_timeframe=config.middle_tf,
+                htf_timeframe=config.htf,
+                middle_timeframe=config.middle_tf,
+                ltf_timeframe=config.ltf,
+                htf_candle_count=len(htf_candles),
+                middle_candle_count=len(middle_candles),
+                ltf_candle_count=len(ltf_candles),
+                htf_bias=result.htf_bias,
+                middle_bias=bias,
                 swing_high_count=sum(1 for l in result.middle_labels if l.type in ("HH", "LH")),
                 swing_low_count=sum(1 for l in result.middle_labels if l.type in ("HL", "LL")),
                 bos_count=len(result.bos_events),

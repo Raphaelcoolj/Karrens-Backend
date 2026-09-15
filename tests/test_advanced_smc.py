@@ -491,7 +491,7 @@ class TestScoring:
         assert confidence_label(70) == "STRONG"
         assert confidence_label(55) == "MODERATE"
         assert confidence_label(40) == "WEAK"
-        assert confidence_label(20) == "NO_SIGNAL"
+        assert confidence_label(20) == "INSUFFICIENT"
 
     def test_assessment_bullish_with_evidence(self):
         score, opposing, label, quality = calculate_assessment_score(

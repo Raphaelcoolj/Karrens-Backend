@@ -45,7 +45,25 @@ class AdvancedSMCStrategy:
     def __init__(self, config: AdvancedSMCConfig | None = None):
         self.config = config or AdvancedSMCConfig()
 
-    def analyze(self, candles: list[Candle]) -> AdvancedSMCSetup:
+    def analyze(
+        self,
+        htf_candles: list[Candle] | None = None,
+        middle_candles: list[Candle] | None = None,
+        ltf_candles: list[Candle] | None = None,
+        candles: list[Candle] | None = None,
+    ) -> AdvancedSMCSetup:
+        if candles is not None and htf_candles is None:
+            htf_candles = candles
+            middle_candles = candles
+            ltf_candles = candles
+
+        if middle_candles is None:
+            middle_candles = []
+        if htf_candles is None:
+            htf_candles = []
+        if ltf_candles is None:
+            ltf_candles = []
+
         setup = AdvancedSMCSetup(
             symbol="",
             htf_timeframe=self.config.htf,
@@ -59,21 +77,41 @@ class AdvancedSMCStrategy:
             return setup
 
         min_candles = self.config.swing_left + self.config.swing_right + 10
-        if len(candles) < min_candles:
-            setup.reasons.append(f"Insufficient data: {len(candles)} candles, need {min_candles}")
+        if len(middle_candles) < min_candles:
+            setup.reasons.append(
+                f"Insufficient middle-TF data: {len(middle_candles)} candles, need {min_candles}"
+            )
             setup.direction = "NO_SIGNAL"
             return setup
 
-        candles = sorted(candles, key=lambda c: c.timestamp)
-        atr = self._compute_atr(candles)
+        if len(htf_candles) < 10:
+            setup.reasons.append(
+                f"Insufficient HTF data: {len(htf_candles)} candles, need at least 10"
+            )
+            setup.direction = "NO_SIGNAL"
+            return setup
+
+        middle_candles = sorted(middle_candles, key=lambda c: c.timestamp)
+        htf_candles = sorted(htf_candles, key=lambda c: c.timestamp)
+        ltf_candles = sorted(ltf_candles, key=lambda c: c.timestamp) if ltf_candles else middle_candles
+
+        atr = self._compute_atr(middle_candles)
         if atr <= 0:
             setup.reasons.append("ATR is zero")
             setup.direction = "NO_SIGNAL"
             return setup
 
-        current_price = candles[-1].close
+        current_price = middle_candles[-1].close
 
-        swings = detect_swings(candles, self.config.swing_left, self.config.swing_right)
+        htf_labels = label_swings(
+            detect_swings(htf_candles, self.config.swing_left, self.config.swing_right)
+        )
+        htf_bias = self._determine_bias(htf_labels)
+
+        setup.htf_labels = htf_labels
+        setup.htf_bias = htf_bias
+
+        swings = detect_swings(middle_candles, self.config.swing_left, self.config.swing_right)
         if len(swings) < 2:
             setup.reasons.append(f"Insufficient swings for structure analysis: {len(swings)}")
             setup.direction = "NO_SIGNAL"
@@ -82,31 +120,31 @@ class AdvancedSMCStrategy:
         labels = label_swings(swings)
         setup.middle_labels = labels
 
-        bos_events = detect_bos(labels, candles)
-        choch_events = detect_choch(labels, candles)
-        idms = detect_idm(labels, swings, candles)
+        bos_events = detect_bos(labels, middle_candles)
+        choch_events = detect_choch(labels, middle_candles)
+        idms = detect_idm(labels, swings, middle_candles)
 
-        bos_swept = check_bos_sweep(bos_events, candles, atr)
-        choch_swept = check_choch_sweep(choch_events, candles, atr)
-        idm_swept = check_idm_sweep(idms, candles, atr, self.config.liquidity_tolerance_atr)
+        bos_swept = check_bos_sweep(bos_events, middle_candles, atr)
+        choch_swept = check_choch_sweep(choch_events, middle_candles, atr)
+        idm_swept = check_idm_sweep(idms, middle_candles, atr, self.config.liquidity_tolerance_atr)
 
-        move_structural_reference_after_sweep(bos_events, candles, labels)
-        move_structural_reference_after_sweep(choch_events, candles, labels)
+        move_structural_reference_after_sweep(bos_events, middle_candles, labels)
+        move_structural_reference_after_sweep(choch_events, middle_candles, labels)
 
-        fvgs = detect_fvg(candles, atr, self.config.fvg_min_atr, self.config.middle_tf) if self.config.fvg_enabled else []
-        ifcs = detect_ifc(candles, atr, self.config.ifc_wick_ratio, self.config.ifc_sweep_atr)
+        fvgs = detect_fvg(middle_candles, atr, self.config.fvg_min_atr, self.config.middle_tf) if self.config.fvg_enabled else []
+        ifcs = detect_ifc(middle_candles, atr, self.config.ifc_wick_ratio, self.config.ifc_sweep_atr)
 
         obs = detect_order_blocks(
-            candles, bos_events, idms, fvgs, ifcs, atr,
+            middle_candles, bos_events, idms, fvgs, ifcs, atr,
             self.config.ob_body_atr, self.config.ob_body_ratio,
         )
 
-        pullbacks = detect_pullbacks_via_liquidity_grab(candles, 0, len(candles) - 1)
-        bias = self._determine_bias(labels)
-        order_flow = detect_order_flow(candles, pullbacks, bias)
+        pullbacks = detect_pullbacks_via_liquidity_grab(middle_candles, 0, len(middle_candles) - 1)
+        bias = htf_bias if htf_bias != "NEUTRAL" else self._determine_bias(labels)
+        order_flow = detect_order_flow(middle_candles, pullbacks, bias)
 
-        liquidity_levels = detect_liquidity(candles, swings, atr, self.config)
-        swept_liquidity = detect_sweeps(candles, liquidity_levels, lookback=20)
+        liquidity_levels = detect_liquidity(middle_candles, swings, atr, self.config)
+        swept_liquidity = detect_sweeps(middle_candles, liquidity_levels, lookback=20)
 
         setup.market_bias = bias
         setup.structure_state = self._describe_structure(labels, bos_events, choch_events, idms)
@@ -130,7 +168,7 @@ class AdvancedSMCStrategy:
 
         setup.direction = direction
 
-        scheme_result = evaluate_all_schemes(candles, idms, ifcs, obs, direction, atr)
+        scheme_result = evaluate_all_schemes(middle_candles, idms, ifcs, obs, direction, atr)
 
         if not scheme_result.found:
             setup.reasons.append("Directional bias detected but no validated entry setup")
@@ -153,11 +191,11 @@ class AdvancedSMCStrategy:
         setup.entry_low = zone.low
         setup.entry_high = zone.high
 
-        sl = self._calc_stop_loss(zone, direction, candles, atr)
+        sl = self._calc_stop_loss(zone, direction, middle_candles, atr)
         setup.stop_loss = sl
 
         risk = self._calc_risk(zone, sl, direction)
-        tps = self._calc_take_profits(zone, direction, risk, liquidity_levels, candles)
+        tps = self._calc_take_profits(zone, direction, risk, liquidity_levels, middle_candles)
         setup.take_profit_1 = tps[0]
         setup.take_profit_2 = tps[1]
         setup.take_profit_3 = tps[2]
@@ -422,10 +460,17 @@ class AdvancedSMCStrategy:
     ) -> list[str]:
         reasons = []
 
+        if setup.htf_labels:
+            htf_bias = self._determine_bias(setup.htf_labels)
+            if htf_bias != "NEUTRAL":
+                reasons.append(f"HTF ({self.config.htf}) bias is {htf_bias.lower()}")
+            else:
+                reasons.append(f"HTF ({self.config.htf}) bias is neutral")
+
         if setup.market_bias == "BULLISH":
-            reasons.append("HTF bias is bullish")
+            reasons.append("Middle-TF bias is bullish")
         elif setup.market_bias == "BEARISH":
-            reasons.append("HTF bias is bearish")
+            reasons.append("Middle-TF bias is bearish")
 
         if setup.bos_events:
             reasons.append(

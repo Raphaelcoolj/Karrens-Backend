@@ -211,4 +211,4 @@ def confidence_label(score: float) -> str:
     elif score >= 35:
         return "WEAK"
     else:
-        return "NO_SIGNAL"
+        return "INSUFFICIENT"
