@@ -21,6 +21,10 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: list[str] = ["*"]
 
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_SUBJECT: str = "mailto:noreply@karren.app"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

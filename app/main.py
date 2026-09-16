@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from app.core.config import get_settings
 from app.core.database import connect_db, close_db
-from app.api import markets, analyze, strategies, analyses, swing_smc, advanced_smc
+from app.api import markets, analyze, strategies, analyses, swing_smc, advanced_smc, notifications, recommendations
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,6 +39,8 @@ app.include_router(strategies.router)
 app.include_router(analyses.router)
 app.include_router(swing_smc.router)
 app.include_router(advanced_smc.router)
+app.include_router(notifications.router)
+app.include_router(recommendations.router)
 
 
 @app.get("/")

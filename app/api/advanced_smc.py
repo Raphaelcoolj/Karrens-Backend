@@ -7,6 +7,19 @@ from datetime import datetime
 from app.strategies.advanced_smc import AdvancedSMCStrategy, AdvancedSMCConfig, Candle
 from app.strategies.advanced_smc.scoring import calculate_assessment_score
 from app.services.market_data import MarketDataService
+from app.services.notification_service import dispatch_signal_notification
+from app.services.recommendation_engine import (
+    compute_recommendation_fingerprint,
+    compute_recommendation_score,
+    classify_quality,
+    classify_asset,
+    determine_recommendation_status,
+    generate_reasons,
+    generate_negative_factors,
+    determine_ltf_confirmation,
+    upsert_recommendation,
+    FRESHNESS_TTL,
+)
 
 router = APIRouter(prefix="/api/analysis/advanced-smc", tags=["advanced-smc"])
 market_service = MarketDataService()
@@ -279,7 +292,7 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
 
         swings = strategy._determine_bias(result.middle_labels) if hasattr(strategy, '_determine_bias') else "NEUTRAL"
 
-        return AdvancedSMCResponse(
+        response = AdvancedSMCResponse(
             symbol=result.symbol,
             strategy="advanced_smc",
             timestamp=datetime.utcnow().isoformat(),
@@ -364,6 +377,116 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             invalidation_conditions=result.invalidation_conditions,
             current_price=current_price,
         )
+
+        if trade_status == "VALIDATED" and result.entry_low and result.stop_loss and result.take_profit_1:
+            try:
+                await dispatch_signal_notification(
+                    symbol=symbol,
+                    timeframe=config.middle_tf,
+                    direction=trade_direction,
+                    entry=result.entry_low,
+                    stop_loss=result.stop_loss,
+                    take_profit=result.take_profit_1,
+                    risk_reward=result.risk_reward or 0,
+                    confidence=int(result.confidence),
+                    quality=quality,
+                    reasons=result.reasons,
+                )
+            except Exception:
+                pass
+
+        ltf_conf = determine_ltf_confirmation(
+            result.ltf_choch_count if hasattr(result, 'ltf_choch_count') else 0,
+            result.ltf_idm_count if hasattr(result, 'ltf_idm_count') else 0,
+            result.ltf_sweep_count if hasattr(result, 'ltf_sweep_count') else 0,
+            trade_direction,
+        )
+
+        rec_score = compute_recommendation_score(
+            trade_status=trade_status,
+            direction=trade_direction,
+            assessment_score=assessment_score,
+            htf_bias=result.htf_bias,
+            middle_bias=bias,
+            ltf_confirmation=ltf_conf,
+            has_bos=has_bos,
+            has_choch=has_choch,
+            idm_count=idm_count,
+            idm_swept=idm_swept_count > 0,
+            ifc_count=ifc_count,
+            fvg_count=fvg_count,
+            ob_count=ob_count,
+            liquidity_sweeps=sweep_count,
+            entry_scheme_found=bool(result.entry_scheme),
+            rr=result.risk_reward,
+            last_analysis=datetime.utcnow(),
+            timeframe=config.middle_tf,
+            has_entry=result.entry_low is not None,
+        )
+
+        rec_status = determine_recommendation_status(trade_status, trade_direction, result.entry_low is not None, rec_score)
+        rec_quality = classify_quality(rec_score)
+        rec_reasons = generate_reasons(
+            trade_direction, result.htf_bias, bias, ltf_conf,
+            has_bos, has_choch, idm_count, idm_swept_count > 0, ifc_count,
+            result.entry_scheme, trade_status, result.entry_low is not None,
+        )
+        rec_negatives = generate_negative_factors(
+            result.htf_bias, bias, ltf_conf, trade_direction,
+            has_bos, has_choch, idm_swept_count > 0, ifc_count,
+            result.risk_reward, result.entry_low is not None, trade_status,
+        )
+
+        fp = compute_recommendation_fingerprint(
+            symbol, config.middle_tf, trade_direction, trade_status,
+            result.entry_low, result.stop_loss, result.take_profit_1,
+            result.structure_state,
+        )
+
+        ttl = FRESHNESS_TTL.get(config.middle_tf, FRESHNESS_TTL["4H"])
+
+        rec_doc = {
+            "symbol": symbol,
+            "asset_class": classify_asset(symbol),
+            "timeframe": config.middle_tf,
+            "direction": trade_direction,
+            "score": rec_score,
+            "quality": rec_quality,
+            "status": rec_status,
+            "trade_status": trade_status,
+            "entry": result.entry_low,
+            "sl": result.stop_loss,
+            "tp": result.take_profit_1,
+            "rr": result.risk_reward,
+            "strategy": "advanced_smc",
+            "reasons": rec_reasons,
+            "negative_factors": rec_negatives,
+            "confirmation_state": trade_status,
+            "structure_summary": result.structure_state,
+            "liquidity_summary": f"{sweep_count} sweeps of {len(result.liquidity_levels)} levels",
+            "poi_summary": result.poi_type or "None detected",
+            "htf_bias": result.htf_bias,
+            "middle_bias": bias,
+            "ltf_confirmation": ltf_conf,
+            "bos_count": len(result.bos_events),
+            "choch_count": len(result.choch_events),
+            "idm_count": idm_count,
+            "idm_swept_count": idm_swept_count,
+            "ifc_count": ifc_count,
+            "fvg_count": fvg_count,
+            "ob_count": ob_count,
+            "liquidity_sweep_count": sweep_count,
+            "recommendation_fingerprint": fp,
+            "last_analysis_at": datetime.utcnow(),
+            "expires_at": datetime.utcnow() + ttl,
+        }
+
+        try:
+            upsert_recommendation(rec_doc)
+        except Exception:
+            pass
+
+        return response
 
     except HTTPException:
         raise

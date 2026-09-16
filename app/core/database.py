@@ -29,6 +29,13 @@ async def connect_db():
     await db.analyses.create_index("pair")
     await db.signals.create_index("timestamp")
     await db.strategies.create_index("created_at")
+
+    from app.services.notification_service import ensure_notification_indexes
+    await ensure_notification_indexes()
+
+    from app.services.recommendation_engine import ensure_recommendation_indexes
+    await ensure_recommendation_indexes()
+
     return db
 
 
