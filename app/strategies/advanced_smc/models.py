@@ -139,6 +139,12 @@ class AdvancedSMCSetup:
     direction: Literal["LONG", "SHORT", "NO_SIGNAL"] = "NO_SIGNAL"
     market_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL"
     htf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL"
+    ltf_bias: Literal["BULLISH", "BEARISH", "NEUTRAL"] = "NEUTRAL"
+
+    # Machine readable reason why this candidate setup was rejected ("" when
+    # the analysis completed normally or is still developing).  Values come
+    # from the REJECTION_* constants in strategy.py.
+    rejection_reason: str = ""
 
     htf_timeframe: str = ""
     middle_timeframe: str = ""
@@ -182,3 +188,10 @@ class AdvancedSMCSetup:
     htf_labels: list[StructureLabel] = field(default_factory=list)
     middle_labels: list[StructureLabel] = field(default_factory=list)
     ltf_labels: list[StructureLabel] = field(default_factory=list)
+
+    # Lower-timeframe structure detection (only populated when distinct LTF
+    # candles were supplied to the strategy).
+    ltf_bos_count: int = 0
+    ltf_choch_count: int = 0
+    ltf_idm_count: int = 0
+    ltf_sweep_count: int = 0

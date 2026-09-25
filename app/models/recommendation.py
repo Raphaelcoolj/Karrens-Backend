@@ -50,6 +50,11 @@ class Recommendation(BaseModel):
     ob_count: int = 0
     liquidity_sweep_count: int = 0
 
+    confidence: Optional[int] = None
+    confidence_label: str = ""
+    setup_status: str = ""
+    risk: str = ""
+
     recommendation_fingerprint: str = ""
 
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -88,6 +93,11 @@ class RecommendationResponse(BaseModel):
     htf_bias: str = "NEUTRAL"
     middle_bias: str = "NEUTRAL"
     ltf_confirmation: str = "NONE"
+
+    confidence: Optional[int] = None
+    confidence_label: str = ""
+    setup_status: str = ""
+    risk: str = ""
 
     created_at: str = ""
     updated_at: str = ""

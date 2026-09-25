@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -24,6 +25,24 @@ class Settings(BaseSettings):
     VAPID_PRIVATE_KEY: str = ""
     VAPID_PUBLIC_KEY: str = ""
     VAPID_SUBJECT: str = "mailto:noreply@karren.app"
+
+    # --- Signal thresholds (optional overrides) ---------------------------
+    # When unset (None) the defaults from app.core.thresholds.SignalThresholds
+    # are used.  Set these via environment to tune the signal engine without
+    # touching code.
+    CONFIDENCE_TIER_VERY_HIGH: Optional[int] = None
+    CONFIDENCE_TIER_HIGH: Optional[int] = None
+    CONFIDENCE_TIER_MODERATE: Optional[int] = None
+    CONFIDENCE_TIER_LOW: Optional[int] = None
+    CONFIDENCE_REFERENCE_EVIDENCE: Optional[float] = None
+
+    # Push-notification policy
+    NOTIFY_MIN_CONFIDENCE: Optional[int] = None
+    NOTIFY_MIN_CONFIDENCE_DELTA: Optional[int] = None
+    NOTIFY_ON_HIGH_CONFIDENCE: Optional[bool] = None
+    NOTIFY_ON_VALIDATED_SETUP: Optional[bool] = None
+    NOTIFY_ON_CONFIDENCE_INCREASE: Optional[bool] = None
+    NOTIFY_ON_DIRECTION_CHANGE: Optional[bool] = None
 
     class Config:
         env_file = ".env"

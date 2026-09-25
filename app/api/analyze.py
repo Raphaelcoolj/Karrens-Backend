@@ -21,6 +21,10 @@ class AnalyzeResponse(BaseModel):
     take_profit: Optional[float] = None
     risk_reward: Optional[float] = None
     confidence: int = 0
+    confidence_label: str = "VERY LOW"
+    setup_status: str = "NONE"
+    risk: str = "UNKNOWN"
+    status: str = "OK"
     reasoning: str = ""
     triggered_conditions: list[str] = []
     invalidating_conditions: list[str] = []
@@ -43,6 +47,7 @@ async def analyze(req: AnalyzeRequest):
 
         signal = result.signal
         snapshot_data = result.market_data_snapshot or {}
+        directional = result.directional or {}
         return AnalyzeResponse(
             pair=result.pair,
             timeframe=result.timeframe,
@@ -52,9 +57,13 @@ async def analyze(req: AnalyzeRequest):
             take_profit=signal.take_profit if signal else None,
             risk_reward=signal.risk_reward if signal else None,
             confidence=signal.confidence if signal else 0,
+            confidence_label=directional.get("confidence_label", "VERY LOW"),
+            setup_status=directional.get("setup_status", "NONE"),
+            risk=directional.get("risk", "UNKNOWN"),
+            status=result.data_status,
             reasoning=signal.reasoning if signal else "",
             triggered_conditions=signal.triggered_conditions if signal else [],
-            invalidating_conditions=signal.invalidating_conditions if signal else [],
+            invalidating_conditions=signal.invalidation_conditions if signal else [],
             strategy_alignment=signal.strategy_alignment if signal else None,
             market_context=signal.market_context if signal else "",
             model_provider=result.model_provider,

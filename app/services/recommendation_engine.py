@@ -28,6 +28,23 @@ FRESHNESS_TTL = {
     "1W": timedelta(days=3),
 }
 
+# Score adjustments applied by compute_recommendation_score when the caller
+# supplies the directional signal's setup status / risk tier.
+SETUP_STATUS_SCORE_ADJUST = {
+    "VALIDATED": 5,
+    "PARTIALLY_CONFIRMED": 2,
+    "WAITING_FOR_CONFIRMATION": 0,
+    "DEVELOPING": -4,
+    "INVALIDATED": -12,
+}
+
+RISK_SCORE_ADJUST = {
+    "LOW": 0,
+    "MODERATE": -2,
+    "HIGH": -5,
+    "VERY HIGH": -9,
+}
+
 
 async def ensure_recommendation_indexes():
     db = get_db()
@@ -175,6 +192,9 @@ def compute_recommendation_score(
     last_analysis: Optional[datetime],
     timeframe: str,
     has_entry: bool,
+    confidence: Optional[int] = None,
+    setup_status: Optional[str] = None,
+    risk: Optional[str] = None,
 ) -> int:
     if direction == "NEUTRAL" and trade_status in ("NO_SETUP", "INSUFFICIENT_DATA"):
         return 0
@@ -198,6 +218,16 @@ def compute_recommendation_score(
         + completeness * 0.15
         + assessment_score * 0.15
     )
+
+    # Optional directional-signal inputs: conviction replaces part of the
+    # structural score, setup status and risk adjust the final standing.
+    if confidence is not None:
+        raw = raw * 0.6 + confidence * 0.4
+    if setup_status is not None:
+        raw += SETUP_STATUS_SCORE_ADJUST.get(setup_status, 0)
+    if risk is not None:
+        raw += RISK_SCORE_ADJUST.get(risk, 0)
+
     final = int(raw * freshness)
     return min(max(final, 0), 100)
 
@@ -319,25 +349,25 @@ def determine_ltf_confirmation(
     return "NONE"
 
 
-def upsert_recommendation(rec_data: dict) -> None:
+async def upsert_recommendation(rec_data: dict) -> None:
     db = get_db()
     fp = rec_data.get("recommendation_fingerprint", "")
     now = datetime.utcnow()
 
-    existing = db[RECOMMENDATION_COLLECTION].find_one({"recommendation_fingerprint": fp})
+    existing = await db[RECOMMENDATION_COLLECTION].find_one({"recommendation_fingerprint": fp})
     if existing:
         update_fields = {k: v for k, v in rec_data.items() if k != "_id"}
         update_fields["updated_at"] = now
-        db[RECOMMENDATION_COLLECTION].update_one(
+        await db[RECOMMENDATION_COLLECTION].update_one(
             {"_id": existing["_id"]}, {"$set": update_fields}
         )
     else:
         rec_data["created_at"] = now
         rec_data["updated_at"] = now
-        db[RECOMMENDATION_COLLECTION].insert_one(rec_data)
+        await db[RECOMMENDATION_COLLECTION].insert_one(rec_data)
 
 
-def get_recommendations(
+async def get_recommendations(
     limit: int = 20,
     asset_class: Optional[str] = None,
     timeframe: Optional[str] = None,
@@ -356,17 +386,17 @@ def get_recommendations(
         query["direction"] = direction
 
     cursor = db[RECOMMENDATION_COLLECTION].find(query).sort("score", DESCENDING).limit(limit)
-    return list(cursor)
+    return await cursor.to_list(length=limit)
 
 
-def get_top_recommendation() -> Optional[dict]:
+async def get_top_recommendation() -> Optional[dict]:
     db = get_db()
-    return db[RECOMMENDATION_COLLECTION].find_one(
+    return await db[RECOMMENDATION_COLLECTION].find_one(
         {"status": {"$in": ["VALIDATED", "WAITING_FOR_CONFIRMATION", "WATCH"]}},
         sort=[("score", DESCENDING)],
     )
 
 
-def delete_recommendation(fingerprint: str) -> None:
+async def delete_recommendation(fingerprint: str) -> None:
     db = get_db()
-    db[RECOMMENDATION_COLLECTION].delete_one({"recommendation_fingerprint": fingerprint})
+    await db[RECOMMENDATION_COLLECTION].delete_one({"recommendation_fingerprint": fingerprint})

@@ -1,13 +1,24 @@
 import asyncio
+import logging
+import httpx
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
 from app.strategies.advanced_smc import AdvancedSMCStrategy, AdvancedSMCConfig, Candle
 from app.strategies.advanced_smc.scoring import calculate_assessment_score
+from app.analysis.engine import analyze_market
 from app.services.market_data import MarketDataService
-from app.services.notification_service import dispatch_signal_notification
+from app.services.notification_service import record_signal_and_evaluate
+from app.services.signal_engine import (
+    generate_directional_signal,
+    STATUS_OK,
+    STATUS_INSUFFICIENT_DATA,
+    STATUS_MARKET_DATA_UNAVAILABLE,
+    STATUS_UPSTREAM_RATE_LIMITED,
+    STATUS_INVALID_SYMBOL,
+)
 from app.services.recommendation_engine import (
     compute_recommendation_fingerprint,
     compute_recommendation_score,
@@ -20,6 +31,8 @@ from app.services.recommendation_engine import (
     upsert_recommendation,
     FRESHNESS_TTL,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/analysis/advanced-smc", tags=["advanced-smc"])
 market_service = MarketDataService()
@@ -116,6 +129,28 @@ class DiagnosticsInfo(BaseModel):
     ifc_count: int = 0
     entry_candidates: int = 0
     rejection_reasons: list[str] = []
+    htf_degraded: bool = False
+    ltf_degraded: bool = False
+    rejection_reason: str = ""
+
+
+class DirectionalInfo(BaseModel):
+    """Always-on directional signal block (direction -> confidence -> setup -> risk)."""
+
+    status: str = "OK"
+    direction: str = "NEUTRAL"
+    confidence: int = 0
+    confidence_label: str = "VERY LOW"
+    setup_status: str = "NONE"
+    risk: str = "UNKNOWN"
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    rr: Optional[float] = None
+    reasons: list[str] = []
+    bullish_score: float = 0.0
+    bearish_score: float = 0.0
+    invalidation_conditions: list[str] = []
 
 
 class AdvancedSMCResponse(BaseModel):
@@ -136,6 +171,7 @@ class AdvancedSMCResponse(BaseModel):
     reasons: list[str]
     invalidation_conditions: list[str]
     current_price: Optional[float] = None
+    directional: DirectionalInfo = Field(default_factory=DirectionalInfo)
 
 
 INTERVAL_MAP = {
@@ -156,6 +192,113 @@ async def _fetch_candles(symbol: str, timeframe: str, limit: int = 200) -> list[
     ]
 
 
+async def _fetch_candles_safe(
+    symbol: str, timeframe: str, limit: int = 200
+) -> tuple[list[Candle], Optional[str]]:
+    """Fetch candles, mapping upstream failures to explicit non-signal statuses."""
+    try:
+        return await _fetch_candles(symbol, timeframe, limit), None
+    except httpx.HTTPStatusError as exc:
+        code = getattr(getattr(exc, "response", None), "status_code", 0)
+        if code == 429:
+            return [], STATUS_UPSTREAM_RATE_LIMITED
+        if 400 <= code < 500:
+            return [], STATUS_INVALID_SYMBOL
+        return [], STATUS_MARKET_DATA_UNAVAILABLE
+    except Exception:
+        # Timeouts, DNS failures, malformed payloads -> upstream unavailable.
+        return [], STATUS_MARKET_DATA_UNAVAILABLE
+
+
+_TIMEFRAME_SECONDS = {
+    "1m": 60, "5m": 300, "15m": 900, "1H": 3600, "4H": 14400,
+    "1D": 86400, "1W": 604800,
+}
+
+
+def _is_stale(candles: list[Candle], timeframe: str) -> bool:
+    """True when the newest candle is older than ~3x the timeframe period."""
+    if not candles:
+        return True
+    seconds = _TIMEFRAME_SECONDS.get(timeframe)
+    if not seconds:
+        return False
+    try:
+        age = (datetime.utcnow() - candles[-1].timestamp).total_seconds()
+    except Exception:
+        return False
+    return age > seconds * 3
+
+
+def _to_klines(candles: list[Candle]) -> list[dict]:
+    return [
+        {
+            "timestamp": c.timestamp.isoformat() if hasattr(c.timestamp, "isoformat") else str(c.timestamp),
+            "open": c.open, "high": c.high, "low": c.low,
+            "close": c.close, "volume": c.volume,
+        }
+        for c in candles
+    ]
+
+
+def _failure_response(
+    symbol: str,
+    config: AdvancedSMCConfig,
+    status: str,
+    directional,
+    detail: str = "",
+) -> AdvancedSMCResponse:
+    """HTTP 200 response carrying an explicit non-signal status (spec section 18)."""
+    reason = detail or f"Signal unavailable: {status}"
+    return AdvancedSMCResponse(
+        symbol=symbol,
+        strategy="advanced_smc",
+        timestamp=datetime.utcnow().isoformat(),
+        bias="NEUTRAL",
+        signal="NEUTRAL",
+        confidence=0.0,
+        assessment=MarketAssessmentInfo(
+            direction="NEUTRAL", score=50, opposing_score=50,
+            label="BALANCED", quality="UNKNOWN", rationale=[reason],
+        ),
+        trade_status=TradeStatusInfo(
+            status="INSUFFICIENT_DATA",
+            direction="NEUTRAL",
+            reason_code=status,
+            reason=reason,
+        ),
+        diagnostics=DiagnosticsInfo(
+            data_valid=False,
+            candle_count=0,
+            requested_timeframe=config.middle_tf,
+            htf_timeframe=config.htf,
+            middle_timeframe=config.middle_tf,
+            ltf_timeframe=config.ltf,
+            rejection_reasons=[reason],
+            rejection_reason=status,
+            htf_degraded=True,
+            ltf_degraded=True,
+        ),
+        structure=StructureInfo(),
+        liquidity=LiquidityInfo(),
+        poi=POIInfo(),
+        entry=EntryInfo(),
+        risk=RiskInfo(),
+        reasons=[reason],
+        invalidation_conditions=[],
+        current_price=None,
+        directional=DirectionalInfo(
+            status=status,
+            direction="NEUTRAL",
+            confidence=0,
+            confidence_label=directional.confidence_label,
+            setup_status="NONE",
+            risk="UNKNOWN",
+            reasons=[reason],
+        ),
+    )
+
+
 @router.post("", response_model=AdvancedSMCResponse)
 async def analyze_advanced_smc(req: AdvancedSMCRequest):
     try:
@@ -174,20 +317,54 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
 
         symbol = req.symbol.upper()
 
-        htf_candles, middle_candles, ltf_candles = await asyncio.gather(
-            _fetch_candles(symbol, config.htf, 200),
-            _fetch_candles(symbol, config.middle_tf, 200),
-            _fetch_candles(symbol, config.ltf, 200),
+        (htf_candles, htf_err), (middle_candles, middle_err), (ltf_candles, ltf_err) = await asyncio.gather(
+            _fetch_candles_safe(symbol, config.htf, 200),
+            _fetch_candles_safe(symbol, config.middle_tf, 200),
+            _fetch_candles_safe(symbol, config.ltf, 200),
         )
 
-        if not middle_candles:
-            raise HTTPException(status_code=404, detail=f"No candle data for {symbol} at {config.middle_tf}")
+        if middle_err or not middle_candles:
+            status = middle_err or STATUS_MARKET_DATA_UNAVAILABLE
+            directional = generate_directional_signal(status=status)
+            logger.warning(f"advanced-smc {symbol}: no middle-TF data ({status})")
+            return _failure_response(symbol, config, status, directional)
+
+        # Graceful degradation: a failed HTF/LTF fetch must never look like
+        # timeframe alignment - the substituted candles are neutralised below.
+        htf_degraded = bool(htf_err) or len(htf_candles) < 10
+        ltf_degraded = bool(ltf_err) or not ltf_candles
+        if htf_degraded:
+            htf_candles = middle_candles
+        if ltf_degraded:
+            ltf_candles = None
 
         strategy = AdvancedSMCStrategy(config)
         result = strategy.analyze(htf_candles, middle_candles, ltf_candles)
         result.symbol = symbol
 
+        if htf_degraded:
+            result.htf_bias = "NEUTRAL"
+            result.htf_labels = []
+
         current_price = middle_candles[-1].close if middle_candles else 0
+
+        try:
+            technical_analysis = analyze_market(_to_klines(middle_candles))
+        except Exception:
+            technical_analysis = {}
+
+        min_candles = (
+            getattr(config, "swing_left", 2) + getattr(config, "swing_right", 2) + 10
+        )
+        data_quality_ok = (not htf_degraded) and len(middle_candles) >= min_candles
+        freshness_degraded = _is_stale(middle_candles, config.middle_tf)
+
+        directional_signal = generate_directional_signal(
+            setup=result,
+            technical_analysis=technical_analysis,
+            data_quality_ok=data_quality_ok,
+            freshness_degraded=freshness_degraded,
+        )
 
         bias = result.market_bias
         has_bos = len(result.bos_events) > 0
@@ -239,7 +416,12 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 reason_code = result.reasons[0] if result.reasons else "NO_ENTRY_SCHEME"
                 reason = reasons_str or "Directional bias detected, waiting for entry confirmation."
         else:
-            has_entry = result.entry_low is not None and result.stop_loss is not None
+            has_entry = (
+                result.entry_low is not None
+                and result.stop_loss is not None
+                and result.take_profit_1 is not None
+                and result.risk_reward is not None
+            )
             if has_entry:
                 trade_status = "VALIDATED"
                 trade_direction = result.direction
@@ -250,6 +432,19 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 trade_direction = result.direction
                 reason_code = result.reasons[0] if result.reasons else "NO_ENTRY_SCHEME"
                 reason = " | ".join(result.reasons) if result.reasons else "Directional bias detected, waiting for entry setup."
+
+        # The directional layer owns the user-facing direction: whenever data
+        # allows, the answer is LONG or SHORT (never an empty "no signal").
+        if directional_signal.status == STATUS_OK:
+            trade_direction = directional_signal.direction
+            signal_value = directional_signal.direction
+        else:
+            trade_direction = "NEUTRAL"
+            signal_value = "NEUTRAL"
+            if trade_status != "INSUFFICIENT_DATA":
+                trade_status = "INSUFFICIENT_DATA"
+                reason_code = directional_signal.status
+                reason = directional_signal.reasons[0] if directional_signal.reasons else directional_signal.status
 
         if trade_status == "VALIDATED":
             risk_label = _classify_risk(
@@ -297,7 +492,7 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             strategy="advanced_smc",
             timestamp=datetime.utcnow().isoformat(),
             bias=result.market_bias,
-            signal=trade_direction if trade_status != "INSUFFICIENT_DATA" else "NEUTRAL",
+            signal=signal_value,
             confidence=result.confidence,
             assessment=MarketAssessmentInfo(
                 direction=direction_for_assessment if direction_for_assessment != "NO_SIGNAL" else "NEUTRAL",
@@ -332,7 +527,7 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 ltf_timeframe=config.ltf,
                 htf_candle_count=len(htf_candles),
                 middle_candle_count=len(middle_candles),
-                ltf_candle_count=len(ltf_candles),
+                ltf_candle_count=len(ltf_candles) if ltf_candles else 0,
                 htf_bias=result.htf_bias,
                 middle_bias=bias,
                 swing_high_count=sum(1 for l in result.middle_labels if l.type in ("HH", "LH")),
@@ -347,6 +542,9 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
                 ifc_count=ifc_count,
                 entry_candidates=1 if result.entry_scheme else 0,
                 rejection_reasons=result.reasons if result.direction == "NO_SIGNAL" else [],
+                htf_degraded=htf_degraded,
+                ltf_degraded=ltf_degraded,
+                rejection_reason=result.rejection_reason,
             ),
             structure=StructureInfo(
                 state=result.structure_state,
@@ -376,24 +574,31 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             reasons=result.reasons,
             invalidation_conditions=result.invalidation_conditions,
             current_price=current_price,
+            directional=DirectionalInfo(
+                status=directional_signal.status,
+                direction=directional_signal.direction,
+                confidence=directional_signal.confidence,
+                confidence_label=directional_signal.confidence_label,
+                setup_status=directional_signal.setup_status,
+                risk=directional_signal.risk,
+                entry=directional_signal.entry,
+                sl=directional_signal.sl,
+                tp=directional_signal.tp,
+                rr=directional_signal.rr,
+                reasons=directional_signal.reasons,
+                bullish_score=directional_signal.bullish_score,
+                bearish_score=directional_signal.bearish_score,
+                invalidation_conditions=directional_signal.invalidation_conditions,
+            ),
         )
 
-        if trade_status == "VALIDATED" and result.entry_low and result.stop_loss and result.take_profit_1:
-            try:
-                await dispatch_signal_notification(
-                    symbol=symbol,
-                    timeframe=config.middle_tf,
-                    direction=trade_direction,
-                    entry=result.entry_low,
-                    stop_loss=result.stop_loss,
-                    take_profit=result.take_profit_1,
-                    risk_reward=result.risk_reward or 0,
-                    confidence=int(result.confidence),
-                    quality=quality,
-                    reasons=result.reasons,
-                )
-            except Exception:
-                pass
+        # One persisted state transition -> at most one push event.
+        try:
+            await record_signal_and_evaluate(
+                symbol, config.middle_tf, directional_signal, result.reasons
+            )
+        except Exception:
+            pass
 
         ltf_conf = determine_ltf_confirmation(
             result.ltf_choch_count if hasattr(result, 'ltf_choch_count') else 0,
@@ -422,6 +627,9 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             last_analysis=datetime.utcnow(),
             timeframe=config.middle_tf,
             has_entry=result.entry_low is not None,
+            confidence=directional_signal.confidence,
+            setup_status=directional_signal.setup_status,
+            risk=directional_signal.risk,
         )
 
         rec_status = determine_recommendation_status(trade_status, trade_direction, result.entry_low is not None, rec_score)
@@ -476,13 +684,17 @@ async def analyze_advanced_smc(req: AdvancedSMCRequest):
             "fvg_count": fvg_count,
             "ob_count": ob_count,
             "liquidity_sweep_count": sweep_count,
+            "confidence": directional_signal.confidence,
+            "confidence_label": directional_signal.confidence_label,
+            "setup_status": directional_signal.setup_status,
+            "risk": directional_signal.risk,
             "recommendation_fingerprint": fp,
             "last_analysis_at": datetime.utcnow(),
             "expires_at": datetime.utcnow() + ttl,
         }
 
         try:
-            upsert_recommendation(rec_doc)
+            await upsert_recommendation(rec_doc)
         except Exception:
             pass
 

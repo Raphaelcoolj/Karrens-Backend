@@ -38,6 +38,7 @@ REJECTION_INVALID_RR = "INVALID_RR"
 REJECTION_LOW_CONFIDENCE = "LOW_CONFIDENCE"
 REJECTION_ATR_ZERO = "ATR_ZERO"
 REJECTION_INVALID_CONFIG = "TIMEFRAME_INVALID"
+REJECTION_NO_DIRECTION = "NO_DIRECTION"
 
 
 class AdvancedSMCStrategy:
@@ -52,7 +53,10 @@ class AdvancedSMCStrategy:
         ltf_candles: list[Candle] | None = None,
         candles: list[Candle] | None = None,
     ) -> AdvancedSMCSetup:
-        if candles is not None and htf_candles is None:
+        # Single-timeframe mode (legacy/tests): no distinct LTF data, so LTF
+        # structure must not be analysed from a duplicate of the middle data.
+        single_tf = candles is not None and htf_candles is None
+        if single_tf:
             htf_candles = candles
             middle_candles = candles
             ltf_candles = candles
@@ -64,6 +68,10 @@ class AdvancedSMCStrategy:
         if ltf_candles is None:
             ltf_candles = []
 
+        # Only analyse LTF structure when distinct lower-timeframe candles were
+        # supplied; otherwise LTF evidence would duplicate the middle timeframe.
+        ltf_provided = (not single_tf) and len(ltf_candles) > 0
+
         setup = AdvancedSMCSetup(
             symbol="",
             htf_timeframe=self.config.htf,
@@ -74,6 +82,7 @@ class AdvancedSMCStrategy:
         if not self.config.is_valid_combo():
             setup.reasons.append("Invalid timeframe combination")
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_INVALID_CONFIG
             return setup
 
         min_candles = self.config.swing_left + self.config.swing_right + 10
@@ -82,6 +91,7 @@ class AdvancedSMCStrategy:
                 f"Insufficient middle-TF data: {len(middle_candles)} candles, need {min_candles}"
             )
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_NO_DATA
             return setup
 
         if len(htf_candles) < 10:
@@ -89,16 +99,18 @@ class AdvancedSMCStrategy:
                 f"Insufficient HTF data: {len(htf_candles)} candles, need at least 10"
             )
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_NO_DATA
             return setup
 
         middle_candles = sorted(middle_candles, key=lambda c: c.timestamp)
         htf_candles = sorted(htf_candles, key=lambda c: c.timestamp)
-        ltf_candles = sorted(ltf_candles, key=lambda c: c.timestamp) if ltf_candles else middle_candles
+        ltf_candles = sorted(ltf_candles, key=lambda c: c.timestamp) if ltf_provided else middle_candles
 
         atr = self._compute_atr(middle_candles)
         if atr <= 0:
             setup.reasons.append("ATR is zero")
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_ATR_ZERO
             return setup
 
         current_price = middle_candles[-1].close
@@ -115,6 +127,7 @@ class AdvancedSMCStrategy:
         if len(swings) < 2:
             setup.reasons.append(f"Insufficient swings for structure analysis: {len(swings)}")
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_NO_SWINGS
             return setup
 
         labels = label_swings(swings)
@@ -158,10 +171,14 @@ class AdvancedSMCStrategy:
         setup.order_flow = [order_flow] if order_flow else []
         setup.ifcs = ifcs
 
+        if ltf_provided:
+            self._analyze_ltf(setup, ltf_candles)
+
         direction = self._determine_direction(bias, bos_events, choch_events, idms, idm_swept)
 
         if direction == "NO_SIGNAL":
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_NO_DIRECTION
             setup.reasons.append("No clear directional bias from market structure")
             self._log_result(setup)
             return setup
@@ -171,6 +188,7 @@ class AdvancedSMCStrategy:
         scheme_result = evaluate_all_schemes(middle_candles, idms, ifcs, obs, direction, atr)
 
         if not scheme_result.found:
+            setup.rejection_reason = REJECTION_NO_ENTRY
             setup.reasons.append("Directional bias detected but no validated entry setup")
             setup.reasons.append(f"Waiting for: {scheme_result.reason}")
             setup.reasons.append(self._describe_wait_reason(direction, idms, idm_swept, ifcs, obs))
@@ -179,6 +197,7 @@ class AdvancedSMCStrategy:
 
         zone = scheme_result.entry_zone
         if zone is None:
+            setup.rejection_reason = REJECTION_NO_POI
             setup.reasons.append("Entry zone calculation returned None")
             self._log_result(setup)
             return setup
@@ -205,6 +224,7 @@ class AdvancedSMCStrategy:
 
         if rr is not None and rr < self.config.minimum_rr:
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_INVALID_RR
             setup.reasons.append(f"R:R {rr:.2f} below minimum {self.config.minimum_rr}")
             self._log_result(setup)
             return setup
@@ -227,6 +247,7 @@ class AdvancedSMCStrategy:
 
         if confidence < self.config.minimum_confidence:
             setup.direction = "NO_SIGNAL"
+            setup.rejection_reason = REJECTION_LOW_CONFIDENCE
             setup.reasons.append(f"Confidence {confidence:.0f} below minimum {self.config.minimum_confidence}")
             self._log_result(setup)
             return setup
@@ -236,6 +257,45 @@ class AdvancedSMCStrategy:
 
         self._log_result(setup)
         return setup
+
+    def _analyze_ltf(self, setup: AdvancedSMCSetup, ltf_candles: list[Candle]) -> None:
+        """Detect lower-timeframe structure for LTF confirmation evidence.
+
+        Only called when distinct LTF candles were supplied; everything written
+        here derives strictly from those candles (no lookahead, no duplicates of
+        the middle timeframe).
+        """
+        try:
+            ltf_swings = detect_swings(
+                ltf_candles, self.config.swing_left, self.config.swing_right
+            )
+        except Exception:
+            return
+
+        if len(ltf_swings) < 2:
+            return
+
+        ltf_labels = label_swings(ltf_swings)
+        setup.ltf_labels = ltf_labels
+        setup.ltf_bias = self._determine_bias(ltf_labels)
+
+        try:
+            ltf_bos = detect_bos(ltf_labels, ltf_candles)
+            ltf_choch = detect_choch(ltf_labels, ltf_candles)
+            ltf_idms = detect_idm(ltf_labels, ltf_swings, ltf_candles)
+        except Exception:
+            return
+
+        ltf_atr = self._compute_atr(ltf_candles)
+        if ltf_atr > 0 and ltf_idms:
+            check_idm_sweep(
+                ltf_idms, ltf_candles, ltf_atr, self.config.liquidity_tolerance_atr
+            )
+
+        setup.ltf_bos_count = len(ltf_bos)
+        setup.ltf_choch_count = len(ltf_choch)
+        setup.ltf_idm_count = len(ltf_idms)
+        setup.ltf_sweep_count = sum(1 for i in ltf_idms if i.swept)
 
     def _compute_atr(self, candles: list[Candle]) -> float:
         period = self.config.atr_period

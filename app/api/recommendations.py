@@ -45,6 +45,10 @@ def _rec_to_response(rec: dict) -> RecommendationResponse:
         htf_bias=rec.get("htf_bias", "NEUTRAL"),
         middle_bias=rec.get("middle_bias", "NEUTRAL"),
         ltf_confirmation=rec.get("ltf_confirmation", "NONE"),
+        confidence=rec.get("confidence"),
+        confidence_label=rec.get("confidence_label", ""),
+        setup_status=rec.get("setup_status", ""),
+        risk=rec.get("risk", ""),
         created_at=rec.get("created_at", datetime.utcnow()).isoformat() if isinstance(rec.get("created_at"), datetime) else str(rec.get("created_at", "")),
         updated_at=rec.get("updated_at", datetime.utcnow()).isoformat() if isinstance(rec.get("updated_at"), datetime) else str(rec.get("updated_at", "")),
         expires_at=rec.get("expires_at").isoformat() if isinstance(rec.get("expires_at"), datetime) else None,
@@ -59,7 +63,10 @@ async def list_recommendations(
     status: Optional[str] = Query(default=None),
     direction: Optional[str] = Query(default=None),
 ):
-    recs = get_recommendations(limit, asset_class, timeframe, status, direction)
+    try:
+        recs = await get_recommendations(limit, asset_class, timeframe, status, direction)
+    except Exception:
+        recs = []
     return RecommendationsListResponse(
         recommendations=[_rec_to_response(r) for r in recs],
         total=len(recs),
@@ -69,7 +76,10 @@ async def list_recommendations(
 
 @router.get("/top", response_model=TopRecommendationResponse)
 async def top_recommendation():
-    rec = get_top_recommendation()
+    try:
+        rec = await get_top_recommendation()
+    except Exception:
+        rec = None
     return TopRecommendationResponse(
         recommendation=_rec_to_response(rec) if rec else None,
         generated_at=datetime.utcnow().isoformat(),

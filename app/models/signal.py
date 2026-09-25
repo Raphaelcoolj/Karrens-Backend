@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional
+from typing import Literal, Optional
 from datetime import datetime
 from enum import Enum
 
@@ -8,6 +8,54 @@ class Direction(str, Enum):
     LONG = "LONG"
     SHORT = "SHORT"
     NO_SIGNAL = "NO SIGNAL"
+
+
+# ---------------------------------------------------------------------------
+# Directional (always-on) signal types
+# ---------------------------------------------------------------------------
+SignalStatus = Literal[
+    "OK",
+    "INSUFFICIENT_DATA",
+    "MARKET_DATA_UNAVAILABLE",
+    "UPSTREAM_RATE_LIMITED",
+    "INVALID_SYMBOL",
+    "ANALYSIS_ERROR",
+]
+
+SetupStatus = Literal[
+    "DEVELOPING",
+    "WAITING_FOR_CONFIRMATION",
+    "PARTIALLY_CONFIRMED",
+    "VALIDATED",
+    "INVALIDATED",
+    "NONE",
+]
+
+RiskLevel = Literal["LOW", "MODERATE", "HIGH", "VERY HIGH", "UNKNOWN"]
+
+
+class DirectionalSignal(BaseModel):
+    """Always-on result for one symbol/timeframe.
+
+    Hierarchy: direction -> confidence -> setup status -> risk -> trade levels.
+    ``entry``/``sl``/``tp``/``rr`` are populated only when the canonical
+    strategy rules produced a fully validated setup.
+    """
+
+    status: SignalStatus = "OK"
+    direction: Literal["LONG", "SHORT", "NEUTRAL"] = "NEUTRAL"
+    confidence: int = Field(default=0, ge=0, le=100)
+    confidence_label: str = "VERY LOW"
+    setup_status: SetupStatus = "NONE"
+    risk: RiskLevel = "UNKNOWN"
+    entry: Optional[float] = None
+    sl: Optional[float] = None
+    tp: Optional[float] = None
+    rr: Optional[float] = None
+    reasons: list[str] = []
+    invalidation_conditions: list[str] = []
+    bullish_score: float = 0.0
+    bearish_score: float = 0.0
 
 
 class SignalBase(BaseModel):
@@ -63,3 +111,6 @@ class AnalysisResult(BaseModel):
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
     processing_time_ms: Optional[int] = None
+    # Explicit non-signal status ("OK" when a direction was produced).
+    data_status: str = "OK"
+    directional: dict = {}
